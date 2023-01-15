@@ -139,6 +139,7 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
     }
 
     println!("starting download...");
+    let mut last_count = 0;
     loop {
         let count = *count.lock().await;
         queue!(std::io::stdout(), cursor::MoveUp(1)).unwrap();
@@ -147,8 +148,14 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
             println!("file {file_path} saved");
             break;
         }
-        println!("Progress: {:.2}% {count}", (count as f64 / content_length as f64 ) * 100_f64);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        println!("Progress:  {:.2}%  {:.2}MB/{:.2}MB  {:.2}MB/s",
+            (count as f64 / content_length as f64 ) * 100_f64,
+            count as f64 / 1024_f64 / 1024_f64,
+            content_length as f64 / 1024_f64 / 1024_f64,
+            (count as f64 - last_count as f64 ) / 1024_f64 / 1024_f64 * 2.0,
+        );
+        last_count = count;
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     for task in tasks {

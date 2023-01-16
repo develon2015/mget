@@ -54,7 +54,7 @@ async fn mget(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("query resource...");
     let resp = client
         .head(url)
-        .header(header::RANGE, "bytes=0-")
+        // .header(header::RANGE, "bytes=0-")
         .send()
         .await;
     let resp = match resp {

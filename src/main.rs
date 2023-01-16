@@ -129,10 +129,22 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
             let range = if n + 1 < t { format!("bytes={sr}-{r}") } else { format!("bytes={sr}-") };
             let mut res = client.get(url).header(header::RANGE, range).send().await.unwrap();
             file.seek(std::io::SeekFrom::Start(sr)).await.unwrap();
+            let mut buffer = Vec::<u8>::with_capacity(64 * 1024);
             while let Some(chunk) = res.chunk().await.unwrap() {
-                file.write_all(&chunk).await.unwrap();
+                if buffer.capacity() < buffer.len() + chunk.len() {
+                    file.write_all(&buffer).await.unwrap();
+                    let mut count = count.lock().await;
+                    *count += buffer.len() as u64;
+                    unsafe { buffer.set_len(0); }
+                }
+                buffer.append(&mut chunk.to_vec());
+            }
+            // 处理剩余未写入文件的buffer
+            if buffer.len() > 0 {
+                file.write_all(&buffer).await.unwrap();
                 let mut count = count.lock().await;
-                *count += chunk.len() as u64;
+                *count += buffer.len() as u64;
+                unsafe { buffer.set_len(0); }
             }
         });
         tasks.push(task);

@@ -97,8 +97,17 @@ fn create_client(url: &str) -> Client {
         .unwrap()
 }
 
-async fn download(client: Client, url: &str, content_length: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_to_file(file: &mut tokio::fs::File, buffer: &mut Vec<u8>, count: &Mutex<u64>, sr: &mut u64) {
     use tokio::io::AsyncWriteExt;
+
+    file.write_all(&buffer).await.unwrap();
+    let mut count = count.lock().await;
+    *count += buffer.len() as u64;
+    *sr += buffer.len() as u64;
+    unsafe { buffer.set_len(0); }
+}
+
+async fn download(client: Client, url: &str, content_length: u64) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::fs::File;
     use tokio::io::AsyncSeekExt;
 
@@ -124,27 +133,40 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
         let mut file = OpenOptions::new().write(true).open(file_path).await?;
         let url = url.to_string();
         let task = tokio::spawn(async move {
-            let sr = n * (content_length / t);
-            let r = (n + 1) * (content_length / t) - 1;
-            let range = if n + 1 < t { format!("bytes={sr}-{r}") } else { format!("bytes={sr}-") };
-            let mut res = client.get(url).header(header::RANGE, range).send().await.unwrap();
-            file.seek(std::io::SeekFrom::Start(sr)).await.unwrap();
-            let mut buffer = Vec::<u8>::with_capacity(64 * 1024);
-            while let Some(chunk) = res.chunk().await.unwrap() {
-                if buffer.capacity() < buffer.len() + chunk.len() {
-                    file.write_all(&buffer).await.unwrap();
-                    let mut count = count.lock().await;
-                    *count += buffer.len() as u64;
-                    unsafe { buffer.set_len(0); }
+            let mut sr = n * (content_length / t);
+            'outer: loop {
+                let r = (n + 1) * (content_length / t) - 1;
+                let range = if n + 1 < t { format!("bytes={sr}-{r}") } else { format!("bytes={sr}-") };
+                // println!("thread {n} starting bytes={sr}-{r} \n");
+                let mut res = client.get(&url).header(header::RANGE, range).send().await
+                    .expect(&format!("thread {n} download failed ({sr}-{r})\n"));
+                file.seek(std::io::SeekFrom::Start(sr)).await.unwrap();
+                let mut buffer = Vec::<u8>::with_capacity(256 * 1024);
+                'inner: loop {
+                    match res.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if buffer.capacity() < buffer.len() + chunk.len() {
+                                write_to_file(&mut file, &mut buffer, &count, &mut sr).await;
+                            }
+                            buffer.append(&mut chunk.to_vec());
+                        },
+                        Ok(None) =>{
+                            println!("thread {n} done \n");
+                            break 'inner;
+                        },
+                        Err(e) => {
+                            println!("thread {n} error: {e} \n");
+                            std::thread::sleep(std::time::Duration::from_millis(2000));
+                            println!("thread {n} retry: bytes={sr}-{r} \n");
+                            continue 'outer;
+                        },
+                    }
                 }
-                buffer.append(&mut chunk.to_vec());
-            }
-            // 处理剩余未写入文件的buffer
-            if buffer.len() > 0 {
-                file.write_all(&buffer).await.unwrap();
-                let mut count = count.lock().await;
-                *count += buffer.len() as u64;
-                unsafe { buffer.set_len(0); }
+                // 处理剩余未写入文件的buffer
+                if buffer.len() > 0 {
+                    write_to_file(&mut file, &mut buffer, &count, &mut sr).await;
+                }
+                break;
             }
         });
         tasks.push(task);

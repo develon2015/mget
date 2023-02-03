@@ -9,3 +9,5 @@ edition = "2021"
 reqwest = { version = "0.11.13", features = ["json"] }
 tokio = { version = "1.24.1", features = ["full"] }
 crossterm = "0.25.0"            # A crossplatform terminal library for manipulating terminals.
+serde = { version = "1.0.152", features = ["derive"] }                       # A generic serialization/deserialization framework
+serde_json = "1.0.91"                # A JSON serialization file format

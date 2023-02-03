@@ -1,23 +1,30 @@
 use reqwest::{Client, header, header::{ACCEPT_RANGES, CONTENT_LENGTH}};
 use crossterm::{cursor, queue, terminal};
-use tokio::{sync::Mutex, fs::OpenOptions};
+use tokio::{sync::Mutex, fs::OpenOptions, io::AsyncReadExt, io::AsyncWriteExt};
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Properties {
     t: u64,
     url: String,
     o: Option<String>,
     proxy: Option<String>,
+    status: Option<Vec<i64>>,
 }
 
-static mut CONFIG: Properties = Properties{ t: 3, url: String::new(), o: None, proxy: None };
+static mut CONFIG: Properties = Properties{ t: 3, url: String::new(), o: None, proxy: None, status: None };
 static UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36";
 
-unsafe fn parse_args() {
+async unsafe fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
+    let mut file: Option<String> = None;
     while let Some(arg)= args.next() {
         match arg.as_str() {
+            "--continue" | "-c" => {
+                let status = args.next().unwrap();
+                file = Some(status);
+            },
             "--thread" | "-t" => {
                 let t = args.next().unwrap();
                 let t = t.parse::<u64>().unwrap();
@@ -36,13 +43,27 @@ unsafe fn parse_args() {
             },
         }
     }
+    if let Some(file) = file {
+        let mut file = tokio::fs::OpenOptions::new().read(true).open(file).await?;
+        let mut buf = String::with_capacity(1024);
+        file.read_to_string(&mut buf).await?;
+        let mut config = serde_json::from_str::<Properties>(&buf).unwrap();
+        if CONFIG.proxy.is_some() {
+            config.proxy = CONFIG.proxy.clone();
+        }
+        if CONFIG.url != "" {
+            config.url = CONFIG.url.clone();
+        }
+        CONFIG = config;
+    }
     #[cfg(debug_assertions)]
     println!("{:#?}", CONFIG);
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe { parse_args() };
+    unsafe { parse_args().await? };
     let url = unsafe { &CONFIG.url };
     mget(url).await?;
     Ok(())
@@ -98,8 +119,6 @@ fn create_client(url: &str) -> Client {
 }
 
 async fn write_to_file(file: &mut tokio::fs::File, buffer: &mut Vec<u8>, count: &Mutex<u64>, sr: &mut u64) {
-    use tokio::io::AsyncWriteExt;
-
     file.write_all(&buffer).await.unwrap();
     let mut count = count.lock().await;
     *count += buffer.len() as u64;
@@ -117,28 +136,52 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
     if let Some(o) = o {
         file_path = o.as_str();
     } else {
-        file_path = "output.mget";
+        file_path = "output";
     }
-    let file = File::create(file_path).await?;
-    file.set_len(content_length).await?;
-    drop(file);
+    if *unsafe { &CONFIG.status } == None {
+        let file = File::create(file_path).await?;
+        file.set_len(content_length).await?;
+        drop(file);
+    }
+
+    let mut status_file_path = file_path.to_string();
+    status_file_path.push_str(".mget");
+    let status_file = OpenOptions::new().create(true).write(true).open(status_file_path).await?;
+    // status_file.set_len(0).await?;
 
     let t = unsafe { CONFIG.t };
+    let map = Arc::new(Mutex::new(vec![0_i64; t as usize]));
     println!("content_length: {content_length}");
     let mut tasks = vec![];
     let count = Arc::new(Mutex::new(0));
     for n in 0..t {
+        let should_sr = n * (content_length / t);
+        let mut sr = should_sr;
+        if let Some(status) = unsafe { &CONFIG.status } {
+            let mut count = count.lock().await;
+            let mut map = map.lock().await;
+            if status[n as usize] == -1 {
+                *count += if n + 1 < t { content_length / t } else { content_length - content_length / t * n };
+                map[n as usize] = -1;
+                continue;
+            }
+            sr = status[n as usize] as u64;
+            // println!("线程{n}从{sr}继续下载");
+            map[n as usize] = sr as i64;
+            *count += sr - should_sr;
+        }
         let client = client.clone();
         let count = count.clone();
         let mut file = OpenOptions::new().write(true).open(file_path).await?;
         let url = url.to_string();
+        let map = map.clone();
+        let mut status_file = status_file.try_clone().await?;
         let task = tokio::spawn(async move {
-            let mut sr = n * (content_length / t);
             'outer: loop {
                 let r = (n + 1) * (content_length / t) - 1;
                 let range = if n + 1 < t { format!("bytes={sr}-{r}") } else { format!("bytes={sr}-") };
                 // println!("thread {n} starting bytes={sr}-{r} \n");
-                let mut res = client.get(&url).header(header::RANGE, range).send().await
+                let mut res = client.get(&url).header(header::RANGE, &range).send().await
                     .expect(&format!("thread {n} download failed ({sr}-{r})\n"));
                 file.seek(std::io::SeekFrom::Start(sr)).await.unwrap();
                 let mut buffer = Vec::<u8>::with_capacity(256 * 1024);
@@ -147,11 +190,18 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
                         Ok(Some(chunk)) => {
                             if buffer.capacity() < buffer.len() + chunk.len() {
                                 write_to_file(&mut file, &mut buffer, &count, &mut sr).await;
+                                let mut map = map.lock().await;
+                                map[n as usize] = sr as i64;
+                                unsafe {
+                                    CONFIG.status = Some(map.clone());
+                                    let status = serde_json::json!(CONFIG);
+                                    status_file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+                                    status_file.write_all(format!("{:#}", status).as_bytes()).await.unwrap();
+                                }
                             }
                             buffer.append(&mut chunk.to_vec());
                         },
-                        Ok(None) =>{
-                            println!("thread {n} done \n");
+                        Ok(None) => {
                             break 'inner;
                         },
                         Err(e) => {
@@ -166,8 +216,18 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
                 if buffer.len() > 0 {
                     write_to_file(&mut file, &mut buffer, &count, &mut sr).await;
                 }
+                let mut map = map.lock().await;
+                map[n as usize] = -1;
+                unsafe {
+                    CONFIG.status = Some(map.clone());
+                    let status = serde_json::json!(CONFIG);
+                    status_file.set_len(0).await.unwrap();
+                    status_file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+                    status_file.write_all(format!("{:#}", status).as_bytes()).await.unwrap();
+                }
                 break;
             }
+            println!("thread {n} done \n");
         });
         tasks.push(task);
     }
@@ -182,7 +242,9 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
             println!("file {file_path} saved");
             break;
         }
-        println!("Progress:  {:.2}%  {:.2}MB/{:.2}MB  {:.2}MB/s",
+        let map = map.lock().await;
+        println!("{:?} Progress:  {:.2}%  {:.2}MB/{:.2}MB  {:.2}MB/s",
+            map,
             (count as f64 / content_length as f64 ) * 100_f64,
             count as f64 / 1024_f64 / 1024_f64,
             content_length as f64 / 1024_f64 / 1024_f64,

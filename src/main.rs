@@ -11,9 +11,10 @@ struct Properties {
     o: Option<String>,
     proxy: Option<String>,
     status: Option<Vec<i64>>,
+    cookies: Option<String>,
 }
 
-static mut CONFIG: Properties = Properties{ t: 3, url: String::new(), o: None, proxy: None, status: None };
+static mut CONFIG: Properties = Properties{ t: 3, url: String::new(), o: None, proxy: None, status: None, cookies: None };
 static UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36";
 
 async unsafe fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,6 +25,29 @@ async unsafe fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
             "--continue" | "-c" => {
                 let status = args.next().unwrap();
                 file = Some(status);
+            },
+            "--cookie" | "--cookies" | "-coo" => {
+                let cookies = args.next().unwrap();
+                let mut file = OpenOptions::new().read(true).open(cookies).await?;
+                let mut cookies = String::with_capacity(20480);
+                file.read_to_string(&mut cookies).await?;
+                let lines = cookies.split("\r\n").collect::<Vec<&str>>();
+                let mut cookies = String::with_capacity(20480);
+                for e in &lines {
+                    if e.starts_with("#") || e.is_empty() {
+                        continue;
+                    }
+                    let e = e.split(char::is_whitespace).collect::<Vec<&str>>();
+                    if e.len() != 7 {
+                        continue;
+                    }
+                    cookies.push_str(&format!("{}={}; ", e[5], e[6]));
+                }
+                if lines.len() > 0 {
+                    cookies.pop();
+                    cookies.pop();
+                }
+                CONFIG.cookies = Some(cookies);
             },
             "--thread" | "-t" => {
                 let t = args.next().unwrap();
@@ -53,6 +77,9 @@ async unsafe fn parse_args() -> Result<(), Box<dyn std::error::Error>> {
         }
         if CONFIG.url != "" {
             config.url = CONFIG.url.clone();
+        }
+        if CONFIG.cookies != None {
+            config.cookies = CONFIG.cookies.clone();
         }
         CONFIG = config;
     }
@@ -107,6 +134,9 @@ fn create_client(url: &str) -> Client {
     let mut headers = header::HeaderMap::new();
     headers.insert(header::USER_AGENT, header::HeaderValue::from_static(UA));
     headers.insert(header::REFERER, header::HeaderValue::from_str(url).unwrap());
+    if let Some(cookies) = unsafe { &CONFIG.cookies } {
+        headers.insert(header::COOKIE, header::HeaderValue::from_str(cookies).unwrap());
+    }
     if let Some(proxy) = unsafe { &CONFIG.proxy } {
         Client::builder()
             .proxy(reqwest::Proxy::http(proxy).unwrap())
@@ -227,7 +257,6 @@ async fn download(client: Client, url: &str, content_length: u64) -> Result<(), 
                 }
                 break;
             }
-            println!("thread {n} done \n");
         });
         tasks.push(task);
     }
